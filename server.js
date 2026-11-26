@@ -66,7 +66,7 @@ function same(a, b) {
 function teams(it) {
   const n = x => (x && x.name) || x;
   if (it.team1 && it.team2) return [n(it.team1), n(it.team2)];
-  const nm = String(it.name || '').replace(/\(.*?\)|\[.*?\]/g, ' ').replace(/^[^\w]+/, '');
+  const nm = dname(it.name).replace(/\(.*?\)|\[.*?\]/g, ' ');
   const p = nm.split(/\s+(?:vs\.?|v|-|–|—|@|x)\s+/i).map(x => x.trim());
   if (p.length < 2) return null;
   p[0] = p[0].replace(/^.*[:|]\s*/, '');
@@ -82,57 +82,81 @@ function matches(a, b) {
 
 // ---------- catalog ----------
 const INC = /live|event|today|upcoming|football|soccer|cricket|basketball|hockey|tennis|sport/i;
-const EXC = /anime|network|24.?7|replay|recap|vod|custom|world/i;
+const EXC = /anime|network|24.?7|replay|recap|vod|custom|world|sports ?event/i;
 const blob = it => [it.name, it.releaseInfo, it.description, (it.genres || []).join(' '), it.category].join(' ');
+const dname = n => String(n || '').replace(/^[\p{Extended_Pictographic}\uFE0F\u200D\s]+/u, '').replace(/^upcoming\s+/i, '').trim();
 function sportOf(t) {
   if (/american football|\bnfl\b|ncaaf|baseball|\bmlb\b|anime|wwe|wrestl|\bufc\b|\bmma\b|boxing|\bf1\b|formula|motogp|motorsport|nascar|golf|darts|snooker|rugby|cycling|\bsports? (world|event)\b/i.test(t)) return null;
-  if (/cricket|wbbl|\bbbl|big bash|\bipl\b|\bt20|\bt10\b|\bodi\b|test match|sa20|ilt20|\bcpl\b|the hundred|\bpsl\b|\blpl\b|\bbpl\b|smash/i.test(t)) return 'Cricket';
+  if (/cricket|wbbl|\bbbl|big bash|\bipl\b|\bicc\b|\bt20|\bt10\b|\bodi\b|test match|sa20|ilt20|\bcpl\b|the hundred|\bpsl\b|\blpl\b|\bbpl\b|smash/i.test(t)) return 'Cricket';
   if (/basketball|\bnba\b|wnba|euroleague|ncaab/i.test(t)) return 'Basketball';
   if (/hockey|\bnhl\b|\bahl\b/i.test(t)) return 'Hockey';
   if (/tennis|\batp\b|\bwta\b|grand slam/i.test(t)) return 'Tennis';
-  if (/football|soccer|premier league|la liga|laliga|serie a|bundesliga|ligue 1|champions league|\bucl\b|europa|\bmls\b|\bepl\b|copa|libertadores|liga mx|\bisl\b|\bafc\b|uefa|fifa|eredivisie|\bfc\b/i.test(t)) return 'Football';
+  if (/football|soccer|premier league|la liga|laliga|serie a|bundesliga|ligue 1|champions league|\bucl\b|europa|\bmls\b|\bepl\b|copa|libertadores|liga mx|\bisl\b|\bafc\b|uefa|fifa|eredivisie|championship|\bfc\b/i.test(t)) return 'Football';
   return 'Sports';
 }
+const MON = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
 function status(it, c) {
-  const t = blob(it);
+  const n = String(it.name || '').trim(), t = blob(it);
+  if (/^🔴/.test(n)) return 'live';
+  if (/^(🔜|⏱|➡|upcoming\b)/i.test(n)) return 'upcoming';
+  if (/^✅/.test(n)) return 'ended';
   if (/\b(ended|finished|full.?time|ft|final score|completed)\b/i.test(t)) return 'ended';
   if (/upcoming|starts? (in|at|on)|scheduled|kick.?off|⏱|\bin \d+ ?(h|m|min|hours?)\b/i.test(t)) return 'upcoming';
   if (/🔴|\blive\b|in.?play|\b\d{1,3}'|1st half|2nd half|half.?time|quarter|period|innings/i.test(t)) return 'live';
+  const d = t.match(/(\d{1,2}) ([A-Za-z]{3}) (\d{4}) · (\d\d):(\d\d) UTC/);
+  if (d && MON[d[2].toLowerCase()] !== undefined) return Date.UTC(+d[3], MON[d[2].toLowerCase()], +d[1], +d[4], +d[5]) > Date.now() ? 'upcoming' : 'ended';
   const k = c.id + ' ' + c.name;
-  if (/live/i.test(k)) return 'live';
+  if (/(^|[_\s])live([_\s]|$)/i.test(k)) return 'live';
   if (/upcoming/i.test(k)) return 'upcoming';
   return null;
 }
+async function pool(tasks, n = 12) {
+  let i = 0;
+  await Promise.all(Array.from({ length: n }, async () => { while (i < tasks.length) { try { await tasks[i++](); } catch {} } }));
+}
+function add(list, x) {
+  const g = list.find(g => matches(g, x));
+  if (!g) return list.push({ ...x, src: [x.src] });
+  if (!g.src.some(s => s[0] === x.src[0] && s[2] === x.src[2])) g.src.push(x.src);
+  if (!g.p) g.p = x.p;
+  if (g.sp === 'Sports' && x.sp !== 'Sports') g.sp = x.sp;
+  if (x.name.length > g.name.length) g.name = x.name;
+}
 
-async function buildCatalog(addons, mode, dbg) {
-  const groups = [];
+async function buildAll(addons, dbg) {
+  const G = { live: [], upcoming: [] }, jobs = [];
   await Promise.all(addons.map(async (a, ai) => {
-    try {
-      const m = await manifest(a);
-      const cats = m.catalogs.filter(c => !/^(other|series|movie)$/.test(c.type) && INC.test(c.id + ' ' + c.name) && !EXC.test(c.id + ' ' + c.name));
-      await Promise.all(cats.map(async c => {
+    let m;
+    try { m = await manifest(a); } catch (e) { dbg && dbg.push({ addon: a.base, error: String(e.message) }); return; }
+    for (const c of m.catalogs) {
+      const k = c.id + ' ' + c.name;
+      if (/^(other|series|movie)$/.test(c.type) || !INC.test(k) || EXC.test(k)) continue;
+      const opts = (c.extra || []).find(e => e.name === 'genre')?.options || [];
+      const targets = opts.length ? opts.map(o => [o, sportOf(o)]).filter(([, s]) => s && s !== 'Sports') : [[null, null]];
+      for (const [g, gs] of targets) jobs.push(async () => {
+        const url = `${a.base}/catalog/${c.type}/${c.id}${g ? '/genre=' + encodeURIComponent(g) : ''}.json`;
+        const d = { addon: m.label, catalog: c.id + (g ? ' | ' + g : ''), total: 0, live: 0, upcoming: 0, sample: [] };
         try {
-          const r = await getJSON(`${a.base}/catalog/${c.type}/${c.id}.json`);
-          const items = (r.metas || []).slice(0, 150), d = { addon: m.label, catalog: c.id, total: items.length, kept: 0, sample: [] };
+          const items = ((await getJSON(url)).metas || []).slice(0, 150);
+          d.total = items.length;
           for (const it of items) {
-            const st = junk(it) ? 'junk' : status(it, c), sp = sportOf(blob(it) + ' ' + c.id + ' ' + c.name);
-            if (dbg && d.sample.length < 4) d.sample.push({ name: it.name, genres: it.genres, releaseInfo: it.releaseInfo, desc: (it.description || '').slice(0, 90), status: st, sport: sp });
-            if (st !== mode || !sp) continue;
-            d.kept++;
-            const x = { name: it.name, sp, t: teams(it), p: it.poster || it.background, src: [ai, c.type, it.id] };
-            const g = groups.find(g => matches(g, x));
-            if (g) { if (!g.src.some(s => s[0] === ai && s[2] === it.id)) g.src.push(x.src); if (!g.p) g.p = x.p; }
-            else groups.push({ ...x, src: [x.src] });
+            const st = junk(it) ? 'junk' : status(it, c), sp = gs || sportOf(blob(it) + ' ' + c.id + ' ' + c.name);
+            if (d.sample.length < 3) d.sample.push({ name: it.name, releaseInfo: it.releaseInfo, status: st, sport: sp });
+            if (!sp || !G[st]) continue;
+            d[st]++;
+            add(G[st], { name: dname(it.name), sp, t: teams(it), p: it.poster || it.background, src: [ai, c.type, it.id] });
           }
-          if (dbg) dbg.push(d);
-        } catch (e) { if (dbg) dbg.push({ addon: m.label, catalog: c.id, error: String(e.message) }); }
-      }));
-    } catch (e) { if (dbg) dbg.push({ addon: a.base, error: String(e.message) }); }
+        } catch (e) { d.error = String(e.message); }
+        dbg && dbg.push(d);
+      });
+    }
   }));
-  return groups.sort((a, b) => b.src.length - a.src.length).map(g => ({
+  await pool(jobs);
+  const metas = l => l.sort((a, b) => b.src.length - a.src.length).map(g => ({
     id: 'agg:' + enc({ n: g.name, p: g.p, s: g.src }), type: 'tv', name: g.name, poster: g.p, posterShape: 'landscape',
-    description: `${g.sp} · ${g.src.length} source(s)`, genres: [g.sp],
+    description: `${g.sp} · ${g.src.length} source(s)`, genres: [g.sp], _sp: g.sp,
   }));
+  return { live: metas(G.live), upcoming: metas(G.upcoming) };
 }
 
 // ---------- streams ----------
@@ -183,27 +207,30 @@ http.createServer(async (req, res) => {
     const p = new URL(req.url, 'http://x').pathname;
     if (p === '/' || p.endsWith('/configure')) return send(res, 200, PAGE, 'text/html; charset=utf-8');
     const dm = p.match(/^\/([^/]+)\/debug\.json$/);
-    if (dm) { const dbg = []; await buildCatalog(parseCfg(dm[1]), 'live', dbg); return send(res, 200, dbg); }
+    if (dm) { const dbg = []; await buildAll(parseCfg(dm[1]), dbg); return send(res, 200, dbg); }
     const m = p.match(/^\/([^/]+)\/(?:manifest\.json|(catalog|meta|stream)\/([^/]+)\/(.+?)\.json)$/);
     if (!m) return send(res, 404, { error: 'not found' });
     const [, seg, kind, , rawId] = m;
     const addons = parseCfg(seg);
     if (!kind) return send(res, 200, {
-      id: 'community.sports.aggregator', version: '1.1.0', name: '🏆 Sports Aggregator',
+      id: 'community.sports.aggregator', version: '1.2.0', name: '🏆 Sports Aggregator',
       description: 'One clean live-sports catalogue merged from your addons, with dead links filtered.',
       resources: ['catalog', 'meta', 'stream'], types: ['tv'], idPrefixes: ['agg:'],
       catalogs: [
         { type: 'tv', id: 'agg_live', name: '🔴 Live Now', extra: [{ name: 'skip', isRequired: false }] },
+        { type: 'tv', id: 'agg_cricket', name: '🏏 Live Cricket', extra: [{ name: 'skip', isRequired: false }] },
+        { type: 'tv', id: 'agg_football', name: '⚽ Live Football', extra: [{ name: 'skip', isRequired: false }] },
         { type: 'tv', id: 'agg_upcoming', name: '⏱ Upcoming', extra: [{ name: 'skip', isRequired: false }] }],
       behaviorHints: { configurable: true },
     });
     const id = decodeURIComponent(rawId).split('/')[0];
     if (kind === 'catalog') {
       if (/skip=[1-9]/.test(decodeURIComponent(rawId))) return send(res, 200, { metas: [] });
-      const mode = id.startsWith('agg_upcoming') ? 'upcoming' : 'live', key = seg + mode;
-      let c = cCache.get(key);
-      if (!c || Date.now() - c.t > 6e4) { c = { t: Date.now(), v: await buildCatalog(addons, mode) }; cCache.set(key, c); }
-      return send(res, 200, { metas: c.v });
+      let c = cCache.get(seg);
+      if (!c || Date.now() - c.t > 6e4) { c = { t: Date.now(), v: await buildAll(addons) }; cCache.set(seg, c); }
+      const L = id === 'agg_upcoming' ? c.v.upcoming.slice(0, 80)
+        : c.v.live.filter(x => id === 'agg_cricket' ? x._sp === 'Cricket' : id === 'agg_football' ? x._sp === 'Football' : true);
+      return send(res, 200, { metas: L.map(({ _sp, ...m }) => m) });
     }
     const pl = dec(id.replace(/^agg:/, ''));
     if (kind === 'meta') return send(res, 200, { meta: { id, type: 'tv', name: pl.n, poster: pl.p, background: pl.p, posterShape: 'landscape' } });
