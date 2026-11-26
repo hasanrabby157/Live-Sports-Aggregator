@@ -48,10 +48,16 @@ async function manifest(a) {
 // ---------- matching ----------
 const clean = s => String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
   .replace(/\b(fc|cf|sc|afc|ac|cd|fk|sk|bk|kk|club|de|the|vs)\b/g, ' ').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+function abbr(a, b) { // "sysw" ~ "sydney sixers women"
+  if (a.includes(' ') || a.length < 3 || a.length > 5 || b.length < a.length * 2 || a[0] !== b[0]) return false;
+  const f = b.replace(/ /g, ''); let i = 0;
+  for (const ch of a) { i = f.indexOf(ch, i); if (i < 0) return false; i++; }
+  return true;
+}
 function same(a, b) {
   a = clean(a); b = clean(b);
   if (!a || !b) return false;
-  if (a === b) return true;
+  if (a === b || abbr(a, b) || abbr(b, a)) return true;
   if (Math.min(a.length, b.length) >= 4 && (a.includes(b) || b.includes(a))) return true;
   const A = new Set(a.split(' ')), B = new Set(b.split(' '));
   const inter = [...A].filter(x => B.has(x)).length;
@@ -60,8 +66,12 @@ function same(a, b) {
 function teams(it) {
   const n = x => (x && x.name) || x;
   if (it.team1 && it.team2) return [n(it.team1), n(it.team2)];
-  const p = String(it.name || '').replace(/^[^\w]+/, '').split(/\s+(?:vs\.?|v|-|@|x)\s+/i);
-  return p.length === 2 ? p : null;
+  const nm = String(it.name || '').replace(/\(.*?\)|\[.*?\]/g, ' ').replace(/^[^\w]+/, '');
+  const p = nm.split(/\s+(?:vs\.?|v|-|–|—|@|x)\s+/i).map(x => x.trim());
+  if (p.length < 2) return null;
+  p[0] = p[0].replace(/^.*[:|]\s*/, '');
+  p[1] = p[1].replace(/\s*[:|].*$/, '');
+  return p[0] && p[1] ? [p[0], p[1]] : null;
 }
 const junk = it => (it.genres || []).includes('NETWORKS') || it.releaseInfo === '24/7' || /24\/7/.test(it.description || '')
   || /^(leaf|recap):/.test(it.id || '');
@@ -75,13 +85,13 @@ const INC = /live|event|today|upcoming|football|soccer|cricket|basketball|hockey
 const EXC = /anime|network|24.?7|replay|recap|vod|custom|world/i;
 const blob = it => [it.name, it.releaseInfo, it.description, (it.genres || []).join(' '), it.category].join(' ');
 function sportOf(t) {
-  if (/american football|\bnfl\b|ncaaf|baseball|\bmlb\b/i.test(t)) return null;
-  if (/cricket|\bipl\b|\bt20|big bash|\bbbl\b|\bpsl\b|\bodi\b|test match/i.test(t)) return 'Cricket';
+  if (/american football|\bnfl\b|ncaaf|baseball|\bmlb\b|anime|wwe|wrestl|\bufc\b|\bmma\b|boxing|\bf1\b|formula|motogp|motorsport|nascar|golf|darts|snooker|rugby|cycling|\bsports? (world|event)\b/i.test(t)) return null;
+  if (/cricket|wbbl|\bbbl|big bash|\bipl\b|\bt20|\bt10\b|\bodi\b|test match|sa20|ilt20|\bcpl\b|the hundred|\bpsl\b|\blpl\b|\bbpl\b|smash/i.test(t)) return 'Cricket';
   if (/basketball|\bnba\b|wnba|euroleague|ncaab/i.test(t)) return 'Basketball';
   if (/hockey|\bnhl\b|\bahl\b/i.test(t)) return 'Hockey';
   if (/tennis|\batp\b|\bwta\b|grand slam/i.test(t)) return 'Tennis';
-  if (/football|soccer|premier league|la liga|laliga|serie a|bundesliga|ligue 1|champions league|\bucl\b|europa|\bmls\b|\bepl\b|copa|libertadores|liga mx|\bisl\b|\bafc\b|uefa|fifa|eredivisie/i.test(t)) return 'Football';
-  return null;
+  if (/football|soccer|premier league|la liga|laliga|serie a|bundesliga|ligue 1|champions league|\bucl\b|europa|\bmls\b|\bepl\b|copa|libertadores|liga mx|\bisl\b|\bafc\b|uefa|fifa|eredivisie|\bfc\b/i.test(t)) return 'Football';
+  return 'Sports';
 }
 function status(it, c) {
   const t = blob(it);
@@ -89,7 +99,7 @@ function status(it, c) {
   if (/upcoming|starts? (in|at|on)|scheduled|kick.?off|⏱|\bin \d+ ?(h|m|min|hours?)\b/i.test(t)) return 'upcoming';
   if (/🔴|\blive\b|in.?play|\b\d{1,3}'|1st half|2nd half|half.?time|quarter|period|innings/i.test(t)) return 'live';
   const k = c.id + ' ' + c.name;
-  if (/(^|[_\s])live([_\s]|$)/i.test(k)) return 'live';
+  if (/live/i.test(k)) return 'live';
   if (/upcoming/i.test(k)) return 'upcoming';
   return null;
 }
@@ -99,7 +109,7 @@ async function buildCatalog(addons, mode, dbg) {
   await Promise.all(addons.map(async (a, ai) => {
     try {
       const m = await manifest(a);
-      const cats = m.catalogs.filter(c => INC.test(c.id + ' ' + c.name) && !EXC.test(c.id + ' ' + c.name));
+      const cats = m.catalogs.filter(c => !/^(other|series|movie)$/.test(c.type) && INC.test(c.id + ' ' + c.name) && !EXC.test(c.id + ' ' + c.name));
       await Promise.all(cats.map(async c => {
         try {
           const r = await getJSON(`${a.base}/catalog/${c.type}/${c.id}.json`);
